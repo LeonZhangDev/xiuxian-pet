@@ -24,6 +24,7 @@ export default function DungeonView({
   onExit: (r: DungeonResult) => void
 }) {
   const canvasRef = useRef<HTMLCanvasElement>(null)
+  const overlayRef = useRef<HTMLCanvasElement>(null)
   const [hud, setHud] = useState<HudState | null>(null)
   const [result, setResult] = useState<DungeonResult | null>(null)
   const resultRef = useRef<DungeonResult | null>(null)
@@ -54,6 +55,7 @@ export default function DungeonView({
   useEffect(() => {
     const d = new Dungeon(
       canvasRef.current!,
+      overlayRef.current!,
       pet,
       (h) => setHud({ ...h, loot: { ...h.loot } }),
       (r) => {
@@ -70,14 +72,23 @@ export default function DungeonView({
   const bossPct = hud?.bossHp != null && hud.bossMax ? (hud.bossHp / hud.bossMax) * 100 : null
   // 画质档：流畅 960×540 / 精致 1280×720 / 极致 1600×900（画布内部分辨率，CSS 仍铺满）
   const [qw, qh] = pet.quality === 'smooth' ? [960, 540] : pet.quality === 'ultra' ? [1600, 900] : [1280, 720]
+  const dpr = typeof window !== 'undefined' ? Math.min(window.devicePixelRatio || 1, 2) : 1
 
   return (
-    <div className="relative mx-auto w-full max-w-[980px]" style={{ fontFamily: '"Kaiti SC", "STKaiti", "KaiTi", "Noto Serif SC", serif' }}>
+    <div className="relative mx-auto aspect-[16/9] w-full max-w-[980px]" style={{ fontFamily: '"Kaiti SC", "STKaiti", "KaiTi", "Noto Serif SC", serif' }}>
+      {/* 世界层（WebGL / 2.5D） */}
       <canvas
         ref={canvasRef}
         width={qw}
         height={qh}
-        className="block w-full cursor-crosshair rounded-md border border-[rgba(211,183,129,0.25)] bg-[#101514] shadow-[0_0_30px_rgba(0,0,0,0.6)]"
+        className="absolute inset-0 z-0 block h-full w-full rounded-md border border-[rgba(211,183,129,0.25)] bg-[#0a1010] shadow-[0_0_30px_rgba(0,0,0,0.6)]"
+      />
+      {/* HUD / 特效 overlay（2D，接收鼠标） */}
+      <canvas
+        ref={overlayRef}
+        width={Math.round(qw * dpr)}
+        height={Math.round(qh * dpr)}
+        className="absolute inset-0 z-[5] block h-full w-full cursor-crosshair rounded-md"
       />
 
       {/* 顶部：气血 + 波次 */}

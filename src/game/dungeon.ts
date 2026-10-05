@@ -37,6 +37,7 @@ import cosMountFoxUrl from '../assets/cos-mount-fox.webp'
 import cosMountTurtleUrl from '../assets/cos-mount-turtle.webp'
 import cosMountSilkwormUrl from '../assets/cos-mount-silkworm.webp'
 import { skinPoseFile } from './packs'
+import { GLWorld, type DungeonGLView } from './gl-world'
 
 export interface DungeonResult {
   victory: boolean
@@ -144,7 +145,7 @@ const REGIONS: RegionDef[] = [
   { name: '万蛊窟', cx: 3850, cy: 1450, r: 340, enemy: 'guboss', count: 1, tier: 4, tile: 'swamp', deco: 'crystal', tint: 'rgba(190,80,160,0.36)' },
 ]
 
-const ENEMY_SPRITE_H: Record<EnemyKind, number> = {
+export const ENEMY_SPRITE_H: Record<EnemyKind, number> = {
   wolf: 62, spider: 54, spirit: 64, golem: 100, boss: 150,
   iceserpent: 70, frostmoth: 58, iceboss: 160,
   guworm: 64, silkworm: 56, plaguetoad: 92, guboss: 165,
@@ -185,8 +186,12 @@ export class Sfx {
 }
 
 export class Dungeon {
-  private canvas: HTMLCanvasElement
-  private ctx: CanvasRenderingContext2D
+  private canvas: HTMLCanvasElement // 接收鼠标事件的画布（= overlayCanvas）
+  private ctx: CanvasRenderingContext2D // 2D overlay context（兼降级渲染）
+  private vw: number
+  private vh: number
+  private dpr = 1
+  private gl: GLWorld | null = null
   private keys = new Set<string>()
   private mouse: Vec = { x: 0, y: 0 }
   private mouseDown = false
@@ -273,15 +278,32 @@ export class Dungeon {
   private onEnd: (r: DungeonResult) => void
 
   constructor(
-    canvas: HTMLCanvasElement,
+    glCanvas: HTMLCanvasElement,
+    overlayCanvas: HTMLCanvasElement,
     pet: PetState,
     onHud: (h: HudState) => void,
     onEnd: (r: DungeonResult) => void,
   ) {
     this.onHud = onHud
     this.onEnd = onEnd
-    this.canvas = canvas
-    this.ctx = canvas.getContext('2d')!
+    this.canvas = overlayCanvas
+    this.ctx = overlayCanvas.getContext('2d')!
+    this.dpr = Math.min(window.devicePixelRatio || 1, 2)
+    this.vw = Math.round(overlayCanvas.width / this.dpr)
+    this.vh = Math.round(overlayCanvas.height / this.dpr)
+    // 2.5D 渲染层（WebGL/Three.js）；初始化失败则回退 Canvas2D
+    try {
+      this.gl = new GLWorld(glCanvas, {
+        vw: this.vw,
+        vh: this.vh,
+        dpr: Math.min(window.devicePixelRatio || 1, 2),
+        quality: pet.quality ?? 'standard',
+        groundDrawer: (ctx, rx, ry, rw, rh) => this.drawGroundRegion(ctx, rx, ry, rw, rh),
+      })
+    } catch (e) {
+      console.warn('[dungeon] WebGL 初始化失败，回退 Canvas2D', e)
+      this.gl = null
+    }
     const cs = combatStats(pet)
     this.player.hp = cs.maxHp
     this.player.maxHp = cs.maxHp
@@ -562,9 +584,13 @@ export class Dungeon {
 
   private onMouseMove = (e: MouseEvent) => {
     const rect = this.canvas.getBoundingClientRect()
-    this.mouse = {
-      x: ((e.clientX - rect.left) / rect.width) * this.canvas.width + this.cam.x,
-      y: ((e.clientY - rect.top) / rect.height) * this.canvas.height + this.cam.y,
+    if (this.gl) {
+      this.mouse = this.gl.screenToWorld(e.clientX, e.clientY, rect)
+    } else {
+      this.mouse = {
+        x: ((e.clientX - rect.left) / rect.width) * this.vw + this.cam.x,
+        y: ((e.clientY - rect.top) / rect.height) * this.vh + this.cam.y,
+      }
     }
   }
   private onMouseDown = (e: MouseEvent) => {
@@ -1303,7 +1329,7 @@ export class Dungeon {
     // ── 相机：平滑跟随 + 朝准星前瞻 ──
     // 原先是硬跟随（每帧钉死在角色身上），背景贴脸滑、毫无速度感；
     // 指数逼近给一点跟随延迟（跑起来画面才"跟得上"），前瞻让人提前看到要去的方向。
-    const vw = this.canvas.width, vh = this.canvas.height
+    const vw = this.vw, vh = this.vh
     const lookX = Math.max(-1, Math.min(1, (this.mouse.x - p.pos.x) / (vw * 0.5)))
     const lookY = Math.max(-1, Math.min(1, (this.mouse.y - p.pos.y) / (vh * 0.5)))
     const lead = p.dashT > 0 ? 92 : 62 // 冲刺时看远一点，便于预判落点
@@ -1349,6 +1375,66 @@ export class Dungeon {
     })
   }
 
+  // ─── 地面烘焙（GL 用）：绘制可见区域地块/区域/边界/山石到任意 ctx ───
+  private drawGroundRegion(ctx: CanvasRenderingContext2D, rx: number, ry: number, rw: number, rh: number) {
+    const barrenImg = this.tileImgs['barren']
+    const barren = barrenImg && this.tileReady['barren'] && barrenImg.complete
+      ? ctx.createPattern(barrenImg, 'repeat') : null
+    ctx.fillStyle = '#141817'
+    ctx.fillRect(rx - 20, ry - 20, rw + 40, rh + 40)
+    if (barren) {
+      ctx.save()
+      ctx.globalAlpha = 0.28
+      ctx.fillStyle = barren
+      ctx.fillRect(rx - 20, ry - 20, rw + 40, rh + 40)
+      ctx.restore()
+    }
+    for (const reg of this.regions) {
+      // 只绘与可见区域相交的区域
+      if (Math.hypot(reg.cx - (rx + rw / 2), reg.cy - (ry + rh / 2)) > reg.r + Math.hypot(rw, rh) / 2) continue
+      const regTileImg = this.tileImgs[reg.tile]
+      const pattern = regTileImg && this.tileReady[reg.tile] && regTileImg.complete
+        ? ctx.createPattern(regTileImg, 'repeat') : null
+      ctx.save()
+      ctx.beginPath()
+      ctx.arc(reg.cx, reg.cy, reg.r, 0, Math.PI * 2)
+      ctx.clip()
+      if (pattern) {
+        ctx.globalAlpha = 0.9
+        ctx.fillStyle = pattern
+        ctx.fillRect(reg.cx - reg.r, reg.cy - reg.r, reg.r * 2, reg.r * 2)
+        ctx.globalAlpha = 1
+      } else {
+        ctx.fillStyle = '#1a201c'
+        ctx.fillRect(reg.cx - reg.r, reg.cy - reg.r, reg.r * 2, reg.r * 2)
+      }
+      ctx.restore()
+      ctx.strokeStyle = reg.tint
+      ctx.lineWidth = 3
+      ctx.beginPath()
+      ctx.arc(reg.cx, reg.cy, reg.r, 0, Math.PI * 2)
+      ctx.stroke()
+      ctx.font = '26px "Noto Serif SC", "SimSun", serif'
+      ctx.textAlign = 'center'
+      ctx.fillStyle = 'rgba(255,255,255,0.14)'
+      ctx.fillText(reg.name, reg.cx, reg.cy - reg.r + 46)
+    }
+    // 世界边界
+    ctx.strokeStyle = 'rgba(150,235,200,0.15)'
+    ctx.lineWidth = 4
+    ctx.strokeRect(8, 8, WORLD_W - 16, WORLD_H - 16)
+    // 山石（静态，烘焙进地面）
+    for (const r of this.rocks) {
+      if (r.pos.x < rx - 40 || r.pos.x > rx + rw + 40 || r.pos.y < ry - 40 || r.pos.y > ry + rh + 40) continue
+      ctx.fillStyle = 'rgba(0,0,0,0.35)'
+      ctx.beginPath(); ctx.ellipse(r.pos.x, r.pos.y + r.r * 0.45, r.r, r.r * 0.35, 0, 0, Math.PI * 2); ctx.fill()
+      ctx.fillStyle = '#2a3230'
+      ctx.beginPath(); ctx.arc(r.pos.x, r.pos.y, r.r * 0.8, 0, Math.PI * 2); ctx.fill()
+      ctx.fillStyle = '#37423e'
+      ctx.beginPath(); ctx.arc(r.pos.x - r.r * 0.2, r.pos.y - r.r * 0.25, r.r * 0.5, 0, Math.PI * 2); ctx.fill()
+    }
+  }
+
   private hurtPlayer(dmg: number, from?: Vec) {
     const p = this.player
     if (p.invuln > 0 || this.ended) return
@@ -1381,10 +1467,12 @@ export class Dungeon {
     if (p.hp <= 0) this.endDungeon(false, true)
   }
 
-  // ─── 渲染 ───
-  private render() {
+  // ─── 渲染（降级：纯 Canvas2D）───
+  private renderCanvas2D() {
     const ctx = this.ctx
-    const vw = this.canvas.width, vh = this.canvas.height
+    const vw = this.vw, vh = this.vh
+    ctx.setTransform(this.dpr, 0, 0, this.dpr, 0, 0)
+    ctx.clearRect(0, 0, vw, vh)
     const sx = (Math.random() - 0.5) * this.shake
     const sy = (Math.random() - 0.5) * this.shake
 
@@ -1970,7 +2058,7 @@ export class Dungeon {
     // 放在 UI（小地图）之后，避免把地图也染红
     const hpRatio = this.player.hp / this.player.maxHp
     if (hpRatio < 0.32 && !this.ended) {
-      const cw = this.canvas.width, ch = this.canvas.height
+      const cw = this.vw, ch = this.vh
       const pulse = 0.5 + 0.5 * Math.sin(performance.now() / 260)
       const depth = (0.32 - hpRatio) / 0.32
       const g = ctx.createRadialGradient(cw / 2, ch / 2, Math.min(cw, ch) * 0.3, cw / 2, ch / 2, Math.max(cw, ch) * 0.62)
@@ -1978,6 +2066,139 @@ export class Dungeon {
       g.addColorStop(1, `rgba(150,20,20,${(0.16 + 0.14 * pulse) * (0.45 + 0.55 * depth)})`)
       ctx.fillStyle = g
       ctx.fillRect(0, 0, cw, ch)
+    }
+  }
+
+  // ─── 渲染（2.5D / WebGL）───
+  private render() {
+    if (!this.gl) { this.renderCanvas2D(); return }
+    this.gl.sync(this as unknown as DungeonGLView, this.cam, this.shake)
+    this.gl.render()
+    this.drawOverlay(this.ctx)
+  }
+
+  // 2D overlay：世界空间（用相机投影对齐 GL 精灵）+ 屏幕空间 HUD
+  private drawOverlay(ctx: CanvasRenderingContext2D) {
+    ctx.setTransform(this.dpr, 0, 0, this.dpr, 0, 0)
+    ctx.clearRect(0, 0, this.vw, this.vh)
+    const w2s = (x: number, y: number) => this.gl!.worldToScreen(x, y)
+    const p = this.player
+    const comp = this.companion
+
+    // 实体落地阴影（投影到 GL 精灵脚下）
+    const shadow = (x: number, y: number, rx: number, ry: number) => {
+      const s = w2s(x, y)
+      ctx.fillStyle = 'rgba(0,0,0,0.38)'
+      ctx.beginPath(); ctx.ellipse(s.x, s.y, rx, ry, 0, 0, Math.PI * 2); ctx.fill()
+    }
+    shadow(p.pos.x, p.pos.y + 12, 16, 5.5)
+    shadow(comp.pos.x, comp.pos.y + 10, 13, 4.5)
+    for (const e of this.enemies) {
+      if (e.dead) continue
+      shadow(e.pos.x, e.pos.y + e.r * 0.6, e.r * 0.9, e.r * 0.3)
+    }
+
+    // 敌人血条
+    for (const e of this.enemies) {
+      if (e.dead || e.hp >= e.maxHp) continue
+      const s = w2s(e.pos.x, e.pos.y - e.r - 14)
+      const bw = Math.max(26, e.r * 2)
+      ctx.fillStyle = 'rgba(0,0,0,0.5)'
+      ctx.fillRect(s.x - bw / 2, s.y, bw, 5)
+      ctx.fillStyle = '#e05545'
+      ctx.fillRect(s.x - bw / 2, s.y, (e.hp / e.maxHp) * bw, 5)
+    }
+
+    // 仙友名 + 喊话气泡
+    {
+      const s = w2s(comp.pos.x, comp.pos.y - 44)
+      ctx.font = '9px "Noto Serif SC", serif'
+      ctx.textAlign = 'center'
+      ctx.fillStyle = 'rgba(255,190,220,0.75)'
+      ctx.fillText(this.companionName, s.x, s.y)
+      if (comp.sayT > 0 && comp.sayText) {
+        ctx.font = '11px "Noto Serif SC", serif'
+        const tw = ctx.measureText(comp.sayText).width
+        const bw = tw + 16
+        const bx = s.x, by = s.y - 10
+        ctx.fillStyle = 'rgba(10,18,16,0.88)'
+        ctx.strokeStyle = 'rgba(255,170,210,0.55)'
+        ctx.lineWidth = 1
+        ctx.beginPath(); ctx.roundRect(bx - bw / 2, by - 18, bw, 20, 8); ctx.fill(); ctx.stroke()
+        ctx.fillStyle = 'rgba(255,225,240,0.95)'
+        ctx.fillText(comp.sayText, bx, by - 4)
+      }
+    }
+
+    // 伤害数字
+    ctx.textAlign = 'center'
+    for (const dn of this.dmgNums) {
+      const s = w2s(dn.pos.x, dn.pos.y)
+      ctx.globalAlpha = Math.min(1, dn.life * 2)
+      ctx.font = dn.crit ? 'bold 22px serif' : 'bold 15px serif'
+      ctx.fillStyle = dn.crit ? '#ffd84a' : '#ffffff'
+      ctx.strokeStyle = 'rgba(0,0,0,0.7)'
+      ctx.lineWidth = 3
+      ctx.strokeText(dn.text, s.x, s.y)
+      ctx.fillText(dn.text, s.x, s.y)
+    }
+    ctx.globalAlpha = 1
+    ctx.textAlign = 'left'
+
+    const vw = this.vw, vh = this.vh
+    // 低血警示（屏幕空间）
+    if (p.hp > 0 && p.hp < p.maxHp * 0.3) {
+      const pulse = 0.5 + 0.5 * Math.sin(performance.now() / 180)
+      const g = ctx.createRadialGradient(vw / 2, vh / 2, vh * 0.3, vw / 2, vh / 2, vh * 0.75)
+      g.addColorStop(0, 'rgba(190,30,30,0)')
+      g.addColorStop(1, `rgba(190,30,30,${0.16 + 0.14 * pulse})`)
+      ctx.fillStyle = g
+      ctx.fillRect(0, 0, vw, vh)
+    }
+
+    // Boss 登场卷轴题名（屏幕空间）
+    if (this.bossIntroT > 0) {
+      const k = 1 - this.bossIntroT / 2.6
+      const unroll = Math.min(1, k / 0.22)
+      const fade = k > 0.78 ? 1 - (k - 0.78) / 0.22 : 1
+      const cw = 460 * unroll
+      const cy = vh * 0.32
+      ctx.save()
+      ctx.globalAlpha = fade
+      const paper = ctx.createLinearGradient(0, cy - 44, 0, cy + 44)
+      paper.addColorStop(0, '#efe3c4'); paper.addColorStop(0.5, '#f7efdb'); paper.addColorStop(1, '#e7d8b4')
+      ctx.fillStyle = paper
+      ctx.beginPath(); ctx.roundRect(vw / 2 - cw / 2, cy - 44, cw, 88, 6); ctx.fill()
+      for (const side of [-1, 1]) {
+        ctx.fillStyle = '#4a3524'
+        ctx.beginPath(); ctx.roundRect(vw / 2 + side * cw / 2 - (side < 0 ? 4 : 10), cy - 52, 14, 104, 7); ctx.fill()
+      }
+      if (unroll > 0.6) {
+        ctx.textAlign = 'center'; ctx.textBaseline = 'middle'
+        ctx.fillStyle = '#8c2f24'
+        ctx.font = 'bold 44px "Kaiti SC", "STKaiti", "KaiTi", serif'
+        ctx.fillText(this.bossIntroName, vw / 2, cy - 4)
+        ctx.font = '15px "Kaiti SC", "STKaiti", "KaiTi", serif'
+        ctx.fillStyle = 'rgba(90,60,30,0.75)'
+        ctx.fillText('— 妖 皇 现 身 —', vw / 2, cy + 30)
+        ctx.textBaseline = 'alphabetic'
+      }
+      ctx.restore()
+    }
+
+    // 小地图（屏幕空间）
+    this.renderMinimap(ctx, vw)
+
+    // 濒死红雾（屏幕空间，置于小地图之后）
+    const hpRatio = p.hp / p.maxHp
+    if (hpRatio < 0.32 && !this.ended) {
+      const pulse = 0.5 + 0.5 * Math.sin(performance.now() / 260)
+      const depth = (0.32 - hpRatio) / 0.32
+      const g = ctx.createRadialGradient(vw / 2, vh / 2, Math.min(vw, vh) * 0.3, vw / 2, vh / 2, Math.max(vw, vh) * 0.62)
+      g.addColorStop(0, 'rgba(170,25,25,0)')
+      g.addColorStop(1, `rgba(150,20,20,${(0.16 + 0.14 * pulse) * (0.45 + 0.55 * depth)})`)
+      ctx.fillStyle = g
+      ctx.fillRect(0, 0, vw, vh)
     }
   }
 }
