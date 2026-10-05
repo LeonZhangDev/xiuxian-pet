@@ -4,6 +4,10 @@
 // 地面（地块/区域/边界）每帧烘焙到离屏画布贴到地面平面；HUD/红雾/小地图/伤害数字仍走 2D overlay。
 import * as THREE from 'three'
 import { ENEMY_SPRITE_H } from './dungeon'
+import { EffectComposer } from 'three/examples/jsm/postprocessing/EffectComposer.js'
+import { RenderPass } from 'three/examples/jsm/postprocessing/RenderPass.js'
+import { UnrealBloomPass } from 'three/examples/jsm/postprocessing/UnrealBloomPass.js'
+import { OutputPass } from 'three/examples/jsm/postprocessing/OutputPass.js'
 
 /** Dungeon 暴露给 GL 渲染器的只读视图（用 any 绕过 private，避免大改可见性） */
 export interface DungeonGLView {
@@ -57,8 +61,14 @@ export class GLWorld {
   private groundMesh: THREE.Mesh
 
   private sky: THREE.Mesh
+  private skyMat!: THREE.MeshBasicMaterial
   private hemi: THREE.HemisphereLight
   private sun: THREE.DirectionalLight
+  private composer: EffectComposer | null = null
+  private bloomPass: UnrealBloomPass | null = null
+  // 区域氛围色调（当前值向目标平滑过渡）
+  private regionTint = new THREE.Color(0x2c3a30)
+  private regionTintTarget = new THREE.Color(0x2c3a30)
 
   private texCache = new Map<HTMLImageElement, THREE.Texture>()
   private enemyPool = new Map<object, THREE.Sprite>()
@@ -78,6 +88,12 @@ export class GLWorld {
 
   private particleGeo: THREE.BufferGeometry
   private particlePts: THREE.Points
+  private readonly MOTE_N = 130
+  private motes: { x: number; y: number; z: number; phase: number; speed: number; size: number; hue: number }[] = []
+  private moteGeo!: THREE.BufferGeometry
+  private motePts!: THREE.Points
+  private motePos!: Float32Array
+  private moteCol!: Float32Array
   private particlePos: Float32Array
   private particleCol: Float32Array
   private readonly PMAX = 900
@@ -108,10 +124,10 @@ export class GLWorld {
     this.camera.lookAt(0, 0, 0)
 
     // 光照氛围：天/地半球光 + 一束斜阳（精灵不吃光，但雾 + 地面 Lambert 有体积感）
-    this.hemi = new THREE.HemisphereLight(0xbfe6ff, 0x2a332c, 0.95)
+    this.hemi = new THREE.HemisphereLight(0xcfe8ff, 0x243029, 0.8)
     this.scene.add(this.hemi)
-    this.sun = new THREE.DirectionalLight(0xffe9c2, 0.7)
-    this.sun.position.set(-0.4, 1, 0.6)
+    this.sun = new THREE.DirectionalLight(0xffe9c2, 0.9)
+    this.sun.position.set(-0.62, 0.7, 0.35) // 偏侧，让地面有受光方向明暗
     this.scene.add(this.sun)
 
     // 地面平面（单位平面，每帧缩放贴到可见区域）
@@ -124,7 +140,7 @@ export class GLWorld {
     this.groundTex.generateMipmaps = true
     // 地面纹理 y 轴与实体世界坐标（Z=wy）对齐：PlaneGeometry(v=0 在底) + 旋转后，
     // 保持 CanvasTexture 默认 flipY=true 即可让「画布顶部=更远(更小 wy)」与 billboard 一致。
-    const groundMat = new THREE.MeshLambertMaterial({ map: this.groundTex, emissive: 0xffffff, emissiveMap: this.groundTex, emissiveIntensity: 0.62 })
+    const groundMat = new THREE.MeshLambertMaterial({ map: this.groundTex, emissive: 0xffffff, emissiveMap: this.groundTex, emissiveIntensity: 0.42 })
     this.groundMesh = new THREE.Mesh(new THREE.PlaneGeometry(1, 1), groundMat)
     this.groundMesh.rotation.x = -Math.PI / 2
     this.scene.add(this.groundMesh)
@@ -135,6 +151,7 @@ export class GLWorld {
       new THREE.MeshBasicMaterial({ map: this.makeSkyTexture(), depthWrite: false, fog: false }),
     )
     this.sky.position.set(0, 1500, -2600)
+    this.skyMat = this.sky.material as THREE.MeshBasicMaterial
     this.scene.add(this.sky)
 
     // 实体精灵（始终存在，按需显隐）
@@ -156,6 +173,37 @@ export class GLWorld {
     this.particlePts = new THREE.Points(this.particleGeo, pMat)
     this.particlePts.frustumCulled = false
     this.scene.add(this.particlePts)
+
+    // 常驻灵气浮尘：缓慢上升的加色发光点，营造灵气氛围（不依赖打击特效）
+    this.moteGeo = new THREE.BufferGeometry()
+    this.motePos = new Float32Array(this.MOTE_N * 3)
+    this.moteCol = new Float32Array(this.MOTE_N * 3)
+    this.moteGeo.setAttribute('position', new THREE.BufferAttribute(this.motePos, 3))
+    this.moteGeo.setAttribute('color', new THREE.BufferAttribute(this.moteCol, 3))
+    for (let i = 0; i < this.MOTE_N; i++) {
+      this.motes.push({ x: 0, y: 0, z: 0, phase: Math.random() * Math.PI * 2, speed: 0.4 + Math.random() * 0.9, size: 2 + Math.random() * 3, hue: 0.5 + Math.random() * 0.12 })
+    }
+    const mMat = new THREE.PointsMaterial({ size: 5, vertexColors: true, transparent: true, depthWrite: false, sizeAttenuation: true, blending: THREE.AdditiveBlending, opacity: 0.85 })
+    this.motePts = new THREE.Points(this.moteGeo, mMat)
+    this.motePts.frustumCulled = false
+    this.scene.add(this.motePts)
+
+    // 后处理：温和 Bloom（雷法/落雷/灵气/亮字发光）。创建失败则降级为普通渲染
+    try {
+      const composer = new EffectComposer(this.renderer)
+      composer.setPixelRatio(this.dpr)
+      composer.setSize(this.vw, this.vh)
+      composer.addPass(new RenderPass(this.scene, this.camera))
+      const bloom = new UnrealBloomPass(new THREE.Vector2(this.vw, this.vh), 0.5, 0.45, 0.8)
+      composer.addPass(bloom)
+      composer.addPass(new OutputPass())
+      this.composer = composer
+      this.bloomPass = bloom
+      console.info('[GLWorld] Bloom 后处理就绪')
+    } catch (e) {
+      this.composer = null
+      console.warn('[GLWorld] Bloom 不可用，降级普通渲染', e)
+    }
   }
 
   private makeSprite(tex: THREE.Texture | null, fog = true): THREE.Sprite {
@@ -205,10 +253,12 @@ export class GLWorld {
     this.renderer.setSize(vw, vh, false)
     this.camera.aspect = vw / vh
     this.camera.updateProjectionMatrix()
+    if (this.composer) { this.composer.setPixelRatio(this.dpr); this.composer.setSize(vw, vh) }
+    if (this.bloomPass) this.bloomPass.setSize(vw, vh)
   }
 
   // 每帧：推状态 + 渲染
-  sync(v: DungeonGLView, cam: { x: number; y: number }, shake: number) {
+  sync(v: DungeonGLView, cam: { x: number; y: number }, shake: number, regionTint?: string) {
     const sx = (Math.random() - 0.5) * shake
     const sy = (Math.random() - 0.5) * shake
 
@@ -242,6 +292,38 @@ export class GLWorld {
     this.syncBolts(v)
     this.syncTelegraphs(v)
     this.syncParticles(v)
+
+    // 区域氛围色调：当前值向目标平滑过渡（雾 + 天幕）
+    if (regionTint) this.regionTintTarget.set(regionTint)
+    this.regionTint.lerp(this.regionTintTarget, 0.04)
+    ;(this.scene.fog as THREE.Fog).color.copy(this.regionTint)
+    // 天幕 = 区域色与白各半，避免整体过暗
+    this.skyMat.color.copy(this.regionTint).lerp(new THREE.Color(0xffffff), 0.45)
+
+    // 灵气浮尘：随相机区域分布、缓慢上升飘动、近地淡入顶部淡出
+    const t = performance.now() / 1000
+    const span = 1500
+    const baseX = cam.x - span / 2
+    const baseZ = cam.y - span / 2
+    for (let i = 0; i < this.MOTE_N; i++) {
+      const m = this.motes[i]
+      const mx = baseX + ((((i * 137.5 + t * 7) % span) + span) % span)
+      const mz = baseZ + ((((i * 91.3 + t * 5) % span) + span) % span)
+      const rise = ((t * m.speed * 22 + m.phase * 40) % 360 + 360) % 360
+      const my = 16 + rise
+      const drift = Math.sin(t * 0.6 + m.phase) * 16
+      this.motePos[i * 3] = mx + drift
+      this.motePos[i * 3 + 1] = my
+      this.motePos[i * 3 + 2] = mz + Math.cos(t * 0.5 + m.phase) * 16
+      const a = Math.min(1, rise / 55) * Math.min(1, (360 - rise) / 130)
+      const col = new THREE.Color().setHSL(m.hue, 0.5, 0.78)
+      this.moteCol[i * 3] = col.r * a
+      this.moteCol[i * 3 + 1] = col.g * a
+      this.moteCol[i * 3 + 2] = col.b * a
+    }
+    this.moteGeo.setDrawRange(0, this.MOTE_N)
+    ;(this.moteGeo.getAttribute('position') as THREE.BufferAttribute).needsUpdate = true
+    ;(this.moteGeo.getAttribute('color') as THREE.BufferAttribute).needsUpdate = true
   }
 
   private bakeGround(rx: number, ry: number, rw: number, rh: number) {
@@ -601,7 +683,9 @@ export class GLWorld {
   }
 
   render() {
-    this.renderer.render(this.scene, this.camera)
+    // 优先走后处理链（温和 Bloom：雷法/落雷/灵气/亮字发光）；不可用则降级普通渲染
+    if (this.composer) this.composer.render()
+    else this.renderer.render(this.scene, this.camera)
   }
 
   // 世界坐标 → overlay 屏幕坐标（逻辑 vw×vh 空间）

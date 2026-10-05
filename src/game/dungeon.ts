@@ -2072,9 +2072,20 @@ export class Dungeon {
   // ─── 渲染（2.5D / WebGL）───
   private render() {
     if (!this.gl) { this.renderCanvas2D(); return }
-    this.gl.sync(this as unknown as DungeonGLView, this.cam, this.shake)
+    this.gl.sync(this as unknown as DungeonGLView, this.cam, this.shake, this.currentRegionTint())
     this.gl.render()
     this.drawOverlay(this.ctx)
+  }
+
+  // 当前玩家所在（或最近）区域的环境色调，用于驱动 GL 雾/天幕氛围色
+  private currentRegionTint(): string {
+    let best = this.regions[0]?.tint ?? 'rgba(44,58,48,0.5)'
+    let bestD = Infinity
+    for (const reg of this.regions) {
+      const d = Math.hypot(this.player.pos.x - reg.cx, this.player.pos.y - reg.cy)
+      if (d < bestD) { bestD = d; best = reg.tint }
+    }
+    return best
   }
 
   // 2D overlay：世界空间（用相机投影对齐 GL 精灵）+ 屏幕空间 HUD
@@ -2085,11 +2096,19 @@ export class Dungeon {
     const p = this.player
     const comp = this.companion
 
-    // 实体落地阴影（投影到 GL 精灵脚下）
+    // 实体落地阴影（投影到 GL 精灵脚下）：径向渐变软接触阴影，近实远虚
     const shadow = (x: number, y: number, rx: number, ry: number) => {
       const s = w2s(x, y)
-      ctx.fillStyle = 'rgba(0,0,0,0.38)'
-      ctx.beginPath(); ctx.ellipse(s.x, s.y, rx, ry, 0, 0, Math.PI * 2); ctx.fill()
+      ctx.save()
+      ctx.translate(s.x, s.y)
+      ctx.scale(1, ry / rx)
+      const g = ctx.createRadialGradient(0, 0, 0, 0, 0, rx)
+      g.addColorStop(0, 'rgba(0,0,0,0.42)')
+      g.addColorStop(0.62, 'rgba(0,0,0,0.17)')
+      g.addColorStop(1, 'rgba(0,0,0,0)')
+      ctx.fillStyle = g
+      ctx.beginPath(); ctx.arc(0, 0, rx, 0, Math.PI * 2); ctx.fill()
+      ctx.restore()
     }
     shadow(p.pos.x, p.pos.y + 12, 16, 5.5)
     shadow(comp.pos.x, comp.pos.y + 10, 13, 4.5)
