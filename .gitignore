@@ -1,0 +1,35 @@
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+node_modules
+dist
+dist-ssr
+*.local
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# --- project specific ---
+# electron-builder 产物（安装包很大，不入库）
+release/
+# NVIDIA 运行时日志误入项目目录
+NVIDIA Corporation/
+# 本地预览/截图产物（开发用，非运行时资源）
+*-sheet-preview.png
+desktop-shot.png
+# 散落的二进制
+*.exe
