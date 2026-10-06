@@ -33,3 +33,6 @@ NVIDIA Corporation/
 desktop-shot.png
 # 散落的二进制
 *.exe
+# 素材审计/生成中间产物
+asset-audit.txt
+.gen-tmp/
