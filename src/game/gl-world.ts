@@ -45,6 +45,9 @@ export interface DungeonGLView {
 type GroundDrawer = (ctx: CanvasRenderingContext2D, rx: number, ry: number, rw: number, rh: number) => void
 
 const GROUND_MARGIN = 240
+const WHITE = new THREE.Color(0xffffff)
+// 立绘染色强度：白向区域色偏移的比例（0=不染，1=完全区域色）。取 0.22 仅轻微偏色，避免"贴片"观感
+const SPRITE_TINT = 0.22
 
 export class GLWorld {
   renderer: THREE.WebGLRenderer
@@ -69,6 +72,8 @@ export class GLWorld {
   // 区域氛围色调（当前值向目标平滑过渡）
   private regionTint = new THREE.Color(0x2c3a30)
   private regionTintTarget = new THREE.Color(0x2c3a30)
+  // 立绘染色：由 regionTint 派生，每帧更新（近白，随区域轻微偏色）
+  private spriteTint = new THREE.Color(0xffffff)
 
   private texCache = new Map<HTMLImageElement, THREE.Texture>()
   private enemyPool = new Map<object, THREE.Sprite>()
@@ -83,17 +88,25 @@ export class GLWorld {
   private playerSprite: THREE.Sprite
   private playerBlinkSprite: THREE.Sprite
   private companionSprite: THREE.Sprite
+  // 玩家行走序列帧图集（4 帧，由主角立绘程序化生成 bob 帧，保证画风一致）
+  private playerSheet: THREE.Texture | null = null
+  private readonly SHEET_F = 4
   private wingSprite: THREE.Sprite
   private mountSprite: THREE.Sprite
 
   private particleGeo: THREE.BufferGeometry
   private particlePts: THREE.Points
+  private softTex!: THREE.CanvasTexture
   private readonly MOTE_N = 130
   private motes: { x: number; y: number; z: number; phase: number; speed: number; size: number; hue: number }[] = []
   private moteGeo!: THREE.BufferGeometry
   private motePts!: THREE.Points
   private motePos!: Float32Array
   private moteCol!: Float32Array
+  // 命中反馈：扩散冲击波环（加色，命中时由 dungeon 触发）
+  private hitRings: THREE.Mesh[] = []
+  private hitRingState: { t: number; max: number; active: boolean; color: THREE.Color }[] = []
+  private lastT = performance.now() / 1000
   private particlePos: Float32Array
   private particleCol: Float32Array
   private readonly PMAX = 900
@@ -163,13 +176,16 @@ export class GLWorld {
     this.scene.add(this.playerSprite, this.playerBlinkSprite, this.companionSprite, this.wingSprite, this.mountSprite)
     this.playerSprite.visible = this.playerBlinkSprite.visible = this.companionSprite.visible = this.wingSprite.visible = this.mountSprite.visible = false
 
+    // 柔光圆点贴图（让粒子/浮尘呈柔和辉光，配合 Bloom）
+    this.softTex = this.makeSoftCircle()
+
     // 粒子点云
     this.particleGeo = new THREE.BufferGeometry()
     this.particlePos = new Float32Array(this.PMAX * 3)
     this.particleCol = new Float32Array(this.PMAX * 3)
     this.particleGeo.setAttribute('position', new THREE.BufferAttribute(this.particlePos, 3))
     this.particleGeo.setAttribute('color', new THREE.BufferAttribute(this.particleCol, 3))
-    const pMat = new THREE.PointsMaterial({ size: 7, vertexColors: true, transparent: true, depthWrite: false, sizeAttenuation: true, blending: THREE.AdditiveBlending })
+    const pMat = new THREE.PointsMaterial({ size: 9, vertexColors: true, map: this.softTex, transparent: true, depthWrite: false, sizeAttenuation: true, blending: THREE.AdditiveBlending })
     this.particlePts = new THREE.Points(this.particleGeo, pMat)
     this.particlePts.frustumCulled = false
     this.scene.add(this.particlePts)
@@ -183,7 +199,7 @@ export class GLWorld {
     for (let i = 0; i < this.MOTE_N; i++) {
       this.motes.push({ x: 0, y: 0, z: 0, phase: Math.random() * Math.PI * 2, speed: 0.4 + Math.random() * 0.9, size: 2 + Math.random() * 3, hue: 0.5 + Math.random() * 0.12 })
     }
-    const mMat = new THREE.PointsMaterial({ size: 5, vertexColors: true, transparent: true, depthWrite: false, sizeAttenuation: true, blending: THREE.AdditiveBlending, opacity: 0.85 })
+    const mMat = new THREE.PointsMaterial({ size: 6, vertexColors: true, map: this.softTex, transparent: true, depthWrite: false, sizeAttenuation: true, blending: THREE.AdditiveBlending, opacity: 0.85 })
     this.motePts = new THREE.Points(this.moteGeo, mMat)
     this.motePts.frustumCulled = false
     this.scene.add(this.motePts)
@@ -228,6 +244,31 @@ export class GLWorld {
     return t
   }
 
+  // 由主角立绘程序化生成 4 帧行走图集：仅做轻微上下 bob，不重绘造型，保证画风零漂移
+  private ensurePlayerSheet(img: HTMLImageElement | null) {
+    if (this.playerSheet || !img || !img.complete || !img.naturalWidth) return
+    const W = img.naturalWidth
+    const H = img.naturalHeight
+    const F = this.SHEET_F
+    const c = document.createElement('canvas')
+    c.width = W * F
+    c.height = H
+    const g = c.getContext('2d')!
+    for (let f = 0; f < F; f++) {
+      const bob = Math.round(Math.sin((f / F) * Math.PI * 2) * (H * 0.014))
+      g.drawImage(img, f * W, bob)
+    }
+    const t = new THREE.CanvasTexture(c)
+    t.colorSpace = THREE.SRGBColorSpace
+    t.minFilter = THREE.LinearMipmapLinearFilter
+    t.magFilter = THREE.LinearFilter
+    t.generateMipmaps = true
+    t.wrapS = THREE.RepeatWrapping
+    t.repeat.set(1 / F, 1)
+    t.needsUpdate = true
+    this.playerSheet = t
+  }
+
   private makeSkyTexture(): THREE.Texture {
     const c = document.createElement('canvas')
     c.width = 16
@@ -240,6 +281,23 @@ export class GLWorld {
     grad.addColorStop(1, '#6b4a32')
     g.fillStyle = grad
     g.fillRect(0, 0, 16, 256)
+    const t = new THREE.CanvasTexture(c)
+    t.colorSpace = THREE.SRGBColorSpace
+    return t
+  }
+
+  // 柔光圆点：径向渐变（中心实→边缘透明），用于粒子/浮尘的柔和辉光
+  private makeSoftCircle(): THREE.CanvasTexture {
+    const s = 64
+    const c = document.createElement('canvas')
+    c.width = c.height = s
+    const g = c.getContext('2d')!
+    const grad = g.createRadialGradient(s / 2, s / 2, 0, s / 2, s / 2, s / 2)
+    grad.addColorStop(0, 'rgba(255,255,255,1)')
+    grad.addColorStop(0.4, 'rgba(255,255,255,0.65)')
+    grad.addColorStop(1, 'rgba(255,255,255,0)')
+    g.fillStyle = grad
+    g.fillRect(0, 0, s, s)
     const t = new THREE.CanvasTexture(c)
     t.colorSpace = THREE.SRGBColorSpace
     return t
@@ -299,24 +357,34 @@ export class GLWorld {
     ;(this.scene.fog as THREE.Fog).color.copy(this.regionTint)
     // 天幕 = 区域色与白各半，避免整体过暗
     this.skyMat.color.copy(this.regionTint).lerp(new THREE.Color(0xffffff), 0.45)
+    // 立绘染色：近白、随区域轻微偏色（白向区域色偏移 SPRITE_TINT）
+    this.spriteTint.copy(WHITE).lerp(this.regionTint, SPRITE_TINT)
 
-    // 灵气浮尘：随相机区域分布、缓慢上升飘动、近地淡入顶部淡出
-    const t = performance.now() / 1000
+    // 帧间隔（用于命中环扩散等需 dt 的动画）
+    const now = performance.now() / 1000
+    const dt = Math.min(0.05, Math.max(0, now - this.lastT))
+    this.lastT = now
+
+    // 灵气浮尘：随相机区域分布、缓慢上升飘动、近地淡入顶部淡出；色相随区域氛围偏移
+    const regionHSL = { h: 0, s: 0, l: 0 }
+    this.regionTint.getHSL(regionHSL)
     const span = 1500
     const baseX = cam.x - span / 2
     const baseZ = cam.y - span / 2
     for (let i = 0; i < this.MOTE_N; i++) {
       const m = this.motes[i]
-      const mx = baseX + ((((i * 137.5 + t * 7) % span) + span) % span)
-      const mz = baseZ + ((((i * 91.3 + t * 5) % span) + span) % span)
-      const rise = ((t * m.speed * 22 + m.phase * 40) % 360 + 360) % 360
+      const mx = baseX + ((((i * 137.5 + now * 7) % span) + span) % span)
+      const mz = baseZ + ((((i * 91.3 + now * 5) % span) + span) % span)
+      const rise = ((now * m.speed * 22 + m.phase * 40) % 360 + 360) % 360
       const my = 16 + rise
-      const drift = Math.sin(t * 0.6 + m.phase) * 16
+      const drift = Math.sin(now * 0.6 + m.phase) * 16
       this.motePos[i * 3] = mx + drift
       this.motePos[i * 3 + 1] = my
-      this.motePos[i * 3 + 2] = mz + Math.cos(t * 0.5 + m.phase) * 16
+      this.motePos[i * 3 + 2] = mz + Math.cos(now * 0.5 + m.phase) * 16
       const a = Math.min(1, rise / 55) * Math.min(1, (360 - rise) / 130)
-      const col = new THREE.Color().setHSL(m.hue, 0.5, 0.78)
+      // 浮尘色相在「自身色调」与「区域氛围色」间插值（60%），实现按区域变色的环境动态
+      const hue = m.hue + (regionHSL.h - m.hue) * 0.6
+      const col = new THREE.Color().setHSL(hue, 0.5, 0.78)
       this.moteCol[i * 3] = col.r * a
       this.moteCol[i * 3 + 1] = col.g * a
       this.moteCol[i * 3 + 2] = col.b * a
@@ -324,6 +392,49 @@ export class GLWorld {
     this.moteGeo.setDrawRange(0, this.MOTE_N)
     ;(this.moteGeo.getAttribute('position') as THREE.BufferAttribute).needsUpdate = true
     ;(this.moteGeo.getAttribute('color') as THREE.BufferAttribute).needsUpdate = true
+
+    // 命中反馈：扩散冲击波环
+    this.syncHitFx(dt)
+  }
+
+  /** 由 dungeon 在命中时调用，于 (x,y) 处生成一道扩散冲击波环 */
+  addHit(x: number, y: number, color: number) {
+    let idx = this.hitRingState.findIndex((s) => !s.active)
+    if (idx < 0) {
+      const m = new THREE.Mesh(
+        new THREE.RingGeometry(0.55, 1, 40),
+        new THREE.MeshBasicMaterial({ transparent: true, side: THREE.DoubleSide, depthWrite: false, fog: false, blending: THREE.AdditiveBlending }),
+      )
+      m.rotation.x = -Math.PI / 2
+      m.frustumCulled = false
+      this.scene.add(m)
+      this.hitRings.push(m)
+      this.hitRingState.push({ t: 0, max: 0.38, active: false, color: new THREE.Color(color) })
+      idx = this.hitRings.length - 1
+    }
+    const st = this.hitRingState[idx]
+    st.active = true
+    st.t = 0
+    st.max = 0.38
+    st.color.set(color)
+    this.hitRings[idx].position.set(x, 18, y)
+    this.hitRings[idx].visible = true
+  }
+
+  private syncHitFx(dt: number) {
+    for (let i = 0; i < this.hitRings.length; i++) {
+      const st = this.hitRingState[i]
+      if (!st.active) continue
+      st.t += dt
+      const k = st.t / st.max
+      if (k >= 1) { st.active = false; this.hitRings[i].visible = false; continue }
+      const m = this.hitRings[i]
+      const r = 12 + k * 78
+      m.scale.set(r, r, 1)
+      const mat = m.material as THREE.MeshBasicMaterial
+      mat.color.copy(st.color)
+      mat.opacity = (1 - k) * 0.85
+    }
   }
 
   private bakeGround(rx: number, ry: number, rw: number, rh: number) {
@@ -374,6 +485,7 @@ export class GLWorld {
       s.position.set(e.pos.x, drawH * 0.5, e.pos.y)
       s.scale.set(drawH * flip, drawH, 1)
       s.material.opacity = flash ? 0.45 : 1
+      s.material.color.copy(this.spriteTint)
     }
     for (const [k, s] of this.enemyPool) {
       if (!seen.has(k)) { s.visible = false; this.enemyPool.delete(k); this.disposeSprite(s) }
@@ -396,6 +508,7 @@ export class GLWorld {
       s.scale.set(drawH * sc, drawH * sc, 1)
       s.material.rotation = k * 0.9
       s.material.opacity = (1 - k) * 0.85
+      s.material.color.copy(this.spriteTint)
     }
     for (const [k, s] of this.dyingPool) {
       if (!seen.has(k)) { s.visible = false; this.dyingPool.delete(k); this.disposeSprite(s) }
@@ -413,6 +526,7 @@ export class GLWorld {
       s.position.set(dc.pos.x, dc.h * 0.5, dc.pos.y)
       s.scale.set(dc.h, dc.h, 1)
       s.material.opacity = 1
+      s.material.color.copy(this.spriteTint)
     }
     for (const [k, s] of this.decoPool) {
       if (!seen.has(k)) { s.visible = false; this.decoPool.delete(k); this.disposeSprite(s) }
@@ -435,6 +549,7 @@ export class GLWorld {
       s.position.set(prop.pos.x, h * 0.5, prop.pos.y + (prop.active ? 0 : 0))
       s.scale.set(h, h, 1)
       s.material.opacity = prop.active ? 1 : (prop.kind === 'herb' ? 0.22 : 0.35)
+      s.material.color.copy(this.spriteTint)
       s.position.y += (prop.active ? 0 : 0)
       if (bob) s.position.y += bob
     }
@@ -464,6 +579,7 @@ export class GLWorld {
       this.mountSprite.position.set(p.pos.x, mh * 0.5 + 8 + mbob, p.pos.y)
       this.mountSprite.scale.set(mh * 1.24 * flip, mh * 1.24, 1)
       this.mountSprite.material.opacity = alpha
+      this.mountSprite.material.color.copy(this.spriteTint)
     } else this.mountSprite.visible = false
 
     // 灵翼（本体之后）
@@ -475,11 +591,27 @@ export class GLWorld {
       this.wingSprite.position.set(p.pos.x, h * 0.5 - 30 + 16, p.pos.y)
       this.wingSprite.scale.set(124 * flip, 87, 1)
       this.wingSprite.material.opacity = alpha * 0.92
+      this.wingSprite.material.color.copy(this.spriteTint)
     } else this.wingSprite.visible = false
 
-    // 本体（眨眼或常态）
+    // 本体（眨眼 / 序列帧行走 / 常态）
     const blinking = performance.now() < v.blinkUntil && v.playerBlinkReady && p.swingT <= 0
-    const bodyTex = this.texFor((blinking ? v.playerBlinkReady : v.playerImgReady) ? (blinking ? v.playerBlinkImg : v.playerImg) : null)
+    let bodyTex: THREE.Texture | null = null
+    if (blinking) {
+      bodyTex = this.texFor(v.playerBlinkImg)
+    } else {
+      this.ensurePlayerSheet(v.playerImgReady ? v.playerImg : null)
+      if (this.playerSheet) {
+        bodyTex = this.playerSheet
+        const moving = Math.hypot(p.vx ?? 0, p.vy ?? 0) > 0.3
+        const frame = moving ? Math.floor(p.walkT * 9) % this.SHEET_F : 0
+        this.playerSheet.offset.x = frame / this.SHEET_F
+        this.playerSheet.repeat.x = 1 / this.SHEET_F
+        this.playerSheet.needsUpdate = true
+      } else {
+        bodyTex = this.texFor(v.playerImgReady ? v.playerImg : null)
+      }
+    }
     if (bodyTex) {
       this.playerSprite.visible = true
       this.playerSprite.material.map = bodyTex
@@ -487,6 +619,7 @@ export class GLWorld {
       this.playerSprite.position.set(p.pos.x, h * 0.5, p.pos.y)
       this.playerSprite.scale.set(h * flip, h, 1)
       this.playerSprite.material.opacity = alpha
+      this.playerSprite.material.color.copy(this.spriteTint)
     } else this.playerSprite.visible = false
   }
 
@@ -502,6 +635,7 @@ export class GLWorld {
       this.companionSprite.position.set(c.pos.x, h * 0.5, c.pos.y)
       this.companionSprite.scale.set(h * flip, h, 1)
       this.companionSprite.material.opacity = 1
+      this.companionSprite.material.color.copy(this.spriteTint)
     } else this.companionSprite.visible = false
   }
 
@@ -524,6 +658,7 @@ export class GLWorld {
       s.position.set(g.pos.x, 34, g.pos.y)
       s.scale.set(68 * flip, 68, 1)
       s.material.opacity = (g.life / g.maxLife) * 0.45
+      s.material.color.copy(this.spriteTint)
     }
   }
 

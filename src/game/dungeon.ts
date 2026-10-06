@@ -748,6 +748,7 @@ export class Dungeon {
   private hurtEnemy(e: Enemy, dmg: number, crit = false, dir?: Vec) {
     e.hp -= dmg
     e.flash = 0.12
+    this.gl?.addHit(e.pos.x, e.pos.y, 0xffffff)
     e.engaged = true
     // 连击：命中即累计，3 秒无命中或受击则断
     this.combo++
@@ -1376,10 +1377,48 @@ export class Dungeon {
   }
 
   // ─── 地面烘焙（GL 用）：绘制可见区域地块/区域/边界/山石到任意 ctx ───
+  private noisePattern: CanvasPattern | null = null
+
+  // 地块 pattern：缩放到指定世界单位边长（源 1024px → 240 世界单位，屏内重复 ≥5 次，充足率 1024/(240*2)≈2.1）
+  private scaledPattern(ctx: CanvasRenderingContext2D, img: HTMLImageElement | undefined, ready: boolean, worldSize: number): CanvasPattern | null {
+    if (!img || !ready || !img.complete || !img.naturalWidth) return null
+    const p = ctx.createPattern(img, 'repeat')
+    if (!p) return null
+    const s = img.naturalWidth / worldSize
+    const m = new DOMMatrix()
+    m.a = s; m.d = s
+    p.setTransform(m)
+    return p
+  }
+
+  // 中观噪波层：稀疏颗粒纹理叠加在地面之上，打破地块平铺的重复感
+  private ensureNoisePattern(ctx: CanvasRenderingContext2D): CanvasPattern | null {
+    if (this.noisePattern) return this.noisePattern
+    const c = document.createElement('canvas')
+    c.width = c.height = 256
+    const g = c.getContext('2d')!
+    const img = g.createImageData(256, 256)
+    for (let i = 0; i < 256 * 256; i++) {
+      const v = 100 + Math.random() * 155
+      img.data[i * 4] = v
+      img.data[i * 4 + 1] = v
+      img.data[i * 4 + 2] = v
+      img.data[i * 4 + 3] = Math.random() < 0.5 ? 0 : 16 // 稀疏低透明颗粒
+    }
+    g.putImageData(img, 0, 0)
+    const p = ctx.createPattern(c, 'repeat')
+    if (p) {
+      const m = new DOMMatrix()
+      m.a = 2; m.d = 2 // 放大 2 倍，颗粒大小约 2 世界单位
+      p.setTransform(m)
+    }
+    this.noisePattern = p
+    return p
+  }
+
   private drawGroundRegion(ctx: CanvasRenderingContext2D, rx: number, ry: number, rw: number, rh: number) {
-    const barrenImg = this.tileImgs['barren']
-    const barren = barrenImg && this.tileReady['barren'] && barrenImg.complete
-      ? ctx.createPattern(barrenImg, 'repeat') : null
+    const TILE_WORLD = 240 // 每块地砖覆盖的世界单位（视口 1280 → 屏内重复 5.3 次）
+    const barren = this.scaledPattern(ctx, this.tileImgs['barren'], this.tileReady['barren'] ?? false, TILE_WORLD)
     ctx.fillStyle = '#141817'
     ctx.fillRect(rx - 20, ry - 20, rw + 40, rh + 40)
     if (barren) {
@@ -1392,9 +1431,7 @@ export class Dungeon {
     for (const reg of this.regions) {
       // 只绘与可见区域相交的区域
       if (Math.hypot(reg.cx - (rx + rw / 2), reg.cy - (ry + rh / 2)) > reg.r + Math.hypot(rw, rh) / 2) continue
-      const regTileImg = this.tileImgs[reg.tile]
-      const pattern = regTileImg && this.tileReady[reg.tile] && regTileImg.complete
-        ? ctx.createPattern(regTileImg, 'repeat') : null
+      const pattern = this.scaledPattern(ctx, this.tileImgs[reg.tile], this.tileReady[reg.tile] ?? false, TILE_WORLD)
       ctx.save()
       ctx.beginPath()
       ctx.arc(reg.cx, reg.cy, reg.r, 0, Math.PI * 2)
@@ -1433,6 +1470,12 @@ export class Dungeon {
       ctx.fillStyle = '#37423e'
       ctx.beginPath(); ctx.arc(r.pos.x - r.r * 0.2, r.pos.y - r.r * 0.25, r.r * 0.5, 0, Math.PI * 2); ctx.fill()
     }
+    // 中观噪波层：叠加稀疏颗粒打破地块平铺的重复感
+    const noise = this.ensureNoisePattern(ctx)
+    if (noise) {
+      ctx.fillStyle = noise
+      ctx.fillRect(rx - 20, ry - 20, rw + 40, rh + 40)
+    }
   }
 
   private hurtPlayer(dmg: number, from?: Vec) {
@@ -1440,6 +1483,7 @@ export class Dungeon {
     if (p.invuln > 0 || this.ended) return
     p.hp -= dmg
     p.flash = 0.2
+    this.gl?.addHit(p.pos.x, p.pos.y, 0xff6a6a)
     p.invuln = 0.5
     this.combo = 0 // 受击断连击
     this.comboT = 0
