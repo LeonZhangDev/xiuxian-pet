@@ -89,7 +89,10 @@ export class GLWorld {
   private playerBlinkSprite: THREE.Sprite
   private companionSprite: THREE.Sprite
   // 玩家行走序列帧图集（4 帧，由主角立绘程序化生成 bob 帧，保证画风一致）
-  private playerSheet: THREE.Texture | null = null
+  // 行走序列帧图集：任意立绘图像 → 4 帧水平图集（逐帧垂直 bob），按图像缓存复用
+  private walkSheets = new Map<HTMLImageElement, THREE.Texture>()
+  // 怪物每个实例需要独立帧偏移，故克隆一份图集（共享同一底图，独立 offset）
+  private enemySheetClones = new Map<object, THREE.Texture>()
   private readonly SHEET_F = 4
   private wingSprite: THREE.Sprite
   private mountSprite: THREE.Sprite
@@ -245,8 +248,12 @@ export class GLWorld {
   }
 
   // 由主角立绘程序化生成 4 帧行走图集：仅做轻微上下 bob，不重绘造型，保证画风零漂移
-  private ensurePlayerSheet(img: HTMLImageElement | null) {
-    if (this.playerSheet || !img || !img.complete || !img.naturalWidth) return
+  // 通用行走图集生成：把单张立绘程序化拆成 F 帧（仅垂直 bob 位移，画风零漂移）
+  // 返回共享底图纹理（每张图像只生成一次），调用方负责按实例设置 offset
+  private makeWalkSheet(img: HTMLImageElement | null): THREE.Texture | null {
+    if (!img || !img.complete || !img.naturalWidth) return null
+    const cached = this.walkSheets.get(img)
+    if (cached) return cached
     const W = img.naturalWidth
     const H = img.naturalHeight
     const F = this.SHEET_F
@@ -266,7 +273,21 @@ export class GLWorld {
     t.wrapS = THREE.RepeatWrapping
     t.repeat.set(1 / F, 1)
     t.needsUpdate = true
-    this.playerSheet = t
+    this.walkSheets.set(img, t)
+    return t
+  }
+
+  // 为某个怪物实例取独立帧偏移的图集副本（共享底图，各自 offset 不打架）
+  private enemySheetFor(e: object, base: THREE.Texture): THREE.Texture {
+    let clone = this.enemySheetClones.get(e)
+    if (!clone) {
+      clone = base.clone()
+      clone.wrapS = THREE.RepeatWrapping
+      clone.repeat.set(1 / this.SHEET_F, 1)
+      clone.needsUpdate = true
+      this.enemySheetClones.set(e, clone)
+    }
+    return clone
   }
 
   private makeSkyTexture(): THREE.Texture {
@@ -474,7 +495,22 @@ export class GLWorld {
     for (const e of v.enemies) {
       if (e.dead) continue
       const img = v.enemyImgs[e.kind]
-      const tex = this.texFor(v.enemyImgReady[e.kind] ? img : null)
+      const ready = v.enemyImgReady[e.kind]
+      const baseSheet = this.makeWalkSheet(ready ? img : null)
+      let tex: THREE.Texture | null
+      if (baseSheet) {
+        // 每个怪物实例独立帧偏移，避免同屏同类怪步伐锁步
+        const clone = this.enemySheetFor(e, baseSheet)
+        const moving = !!e.engaged
+        const phase = (e.pos.x * 0.13 + e.pos.y * 0.07)
+        const frame = moving ? Math.floor(performance.now() / 110 + phase) % this.SHEET_F : 0
+        clone.offset.x = ((frame % this.SHEET_F) + this.SHEET_F) % this.SHEET_F / this.SHEET_F
+        clone.repeat.x = 1 / this.SHEET_F
+        clone.needsUpdate = true
+        tex = clone
+      } else {
+        tex = this.texFor(ready ? img : null)
+      }
       if (!tex) continue
       const s = this.spriteFrom(this.enemyPool, e, tex)
       if (!s) continue
@@ -489,6 +525,14 @@ export class GLWorld {
     }
     for (const [k, s] of this.enemyPool) {
       if (!seen.has(k)) { s.visible = false; this.enemyPool.delete(k); this.disposeSprite(s) }
+    }
+    // 清理已消失怪物占用的图集副本（释放 GPU 纹理）
+    for (const k of this.enemySheetClones.keys()) {
+      if (!seen.has(k)) {
+        const t = this.enemySheetClones.get(k)
+        t?.dispose()
+        this.enemySheetClones.delete(k)
+      }
     }
   }
 
@@ -600,14 +644,14 @@ export class GLWorld {
     if (blinking) {
       bodyTex = this.texFor(v.playerBlinkImg)
     } else {
-      this.ensurePlayerSheet(v.playerImgReady ? v.playerImg : null)
-      if (this.playerSheet) {
-        bodyTex = this.playerSheet
+      const sheet = this.makeWalkSheet(v.playerImgReady ? v.playerImg : null)
+      if (sheet) {
+        bodyTex = sheet
         const moving = Math.hypot(p.vx ?? 0, p.vy ?? 0) > 0.3
         const frame = moving ? Math.floor(p.walkT * 9) % this.SHEET_F : 0
-        this.playerSheet.offset.x = frame / this.SHEET_F
-        this.playerSheet.repeat.x = 1 / this.SHEET_F
-        this.playerSheet.needsUpdate = true
+        sheet.offset.x = frame / this.SHEET_F
+        sheet.repeat.x = 1 / this.SHEET_F
+        sheet.needsUpdate = true
       } else {
         bodyTex = this.texFor(v.playerImgReady ? v.playerImg : null)
       }
@@ -625,10 +669,18 @@ export class GLWorld {
 
   private syncCompanion(v: DungeonGLView) {
     const c = v.companion
-    const tex = this.texFor(v.companionImgReady ? v.companionImg : null)
+    const sheet = this.makeWalkSheet(v.companionImgReady ? v.companionImg : null)
+    const tex = sheet ?? this.texFor(v.companionImgReady ? v.companionImg : null)
     if (tex) {
       this.companionSprite.visible = true
       this.companionSprite.material.map = tex
+      if (sheet) {
+        const moving = Math.hypot(c.vx ?? 0, c.vy ?? 0) > 0.3
+        const frame = moving ? Math.floor((c.walkT ?? 0) * 9) % this.SHEET_F : 0
+        sheet.offset.x = frame / this.SHEET_F
+        sheet.repeat.x = 1 / this.SHEET_F
+        sheet.needsUpdate = true
+      }
       this.companionSprite.material.needsUpdate = true
       const h = 56
       const flip = v.player && v.player.pos.x > c.pos.x ? -1 : 1
